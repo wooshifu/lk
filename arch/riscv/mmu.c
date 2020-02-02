@@ -10,8 +10,14 @@
 #include <lk/debug.h>
 #include <arch/mmu.h>
 
-
 #if RISCV_MMU
+
+#if __riscv_xlen == 32
+#error "32 bit mmu not supported yet"
+#endif
+
+uint64_t kernel_pgtable[512 * 4] __ALIGNED(PAGE_SIZE);
+
 
 /* initialize per address space */
 status_t arch_mmu_init_aspace(arch_aspace_t *aspace, vaddr_t base, size_t size, uint flags) {

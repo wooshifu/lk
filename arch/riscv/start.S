@@ -25,7 +25,7 @@ FUNCTION(_start)
 
     // if the hart is too high, trap it
     li      t0, RISCV_MAX_HARTS
-    ble     t0, a0, .Lhart_trap
+    ble     t0, a0, hart_trap
 
     // set the default stack per cpu
     la      sp, default_stack_top
@@ -38,7 +38,7 @@ FUNCTION(_start)
 
     // if our hart isnt RISCV_BOOT_HART, trap the cpu
     li      t2, RISCV_BOOT_HART
-    bne     t2, a0, .Lsecondary_trap
+    bne     t2, a0, secondary_trap
 
 #if ARCH_RISCV_TWOSEGMENT
     // copy preinitialized data from flash to memory
@@ -63,6 +63,10 @@ FUNCTION(_start)
     sw      zero, (t0)
     add     t0, t0, 4
     bne     t0, t1, 0b
+
+#if RISCV_MMU
+    jal     _mmu_init
+#endif
 
 #if WITH_SMP
     // Release any other harts into riscv_secondary_entry
@@ -89,12 +93,17 @@ FUNCTION(_start)
     // should never return here
     j       .
 
-.Lsecondary_trap:
+LOCAL_FUNCTION(secondary_trap)
 #if WITH_SMP
     // wait for _boot_status to be nonzero, then go into riscv_secondary_entry
     la      t5, _boot_status
     lb      t0, (t5)
-    beqz    t0, .Lsecondary_trap
+    beqz    t0, secondary_trap
+
+#if RISCV_MMU
+    // TODO: enable the mmu on this core
+    jal     .Lenable_mmu
+#endif
 
     // set the per cpu structure before getting into the secondary boot path
     jal     riscv_configure_percpu_early
@@ -106,10 +115,69 @@ FUNCTION(_start)
     j       .
 #endif
 
-.Lhart_trap:
+LOCAL_FUNCTION(hart_trap)
     // cpus with too high of a hart id go here and spin forever
     wfi
     j       .
+
+#if RISCV_MMU
+    // initialize the kernel page tables
+    // TODO: follow mmu_initial_mappings
+    // TODO: implement sv39
+    // for now map the first 512GB of the physical address space at the
+    // bottom of the kernel address space using a single terapage
+LOCAL_FUNCTION(_mmu_init)
+
+    // map the first 512GB using a single 512GB terapage
+    la      t0, kernel_pgtable
+    // address 0, A, D, G, XWR, V
+    li      t1, (0 | (1<<7) | (1<<6) | (1<<5) | (1<<3) | (1<<2) | (1<<1) | (1<<0))
+    li      t2, (8 * 256)
+    add     t2, t0, t2
+    sd      t1, (t2)
+
+    // identity map at 0 to cover where we're already running
+    sd      t1, (t0)
+
+    // ensure it's written out
+    fence   w,w
+
+.Lenable_mmu:
+    // set the satp register and enable the mmu
+    // sv48, ASID 0, kernel_pgtable address
+    la      t0, kernel_pgtable
+    srli    t1, t0, 12
+    li      t2, (9 << 60)   // mode 9, SV48
+    or      t1, t1, t2
+    csrw    satp, t1
+
+    // global tlb fence
+    sfence.vma  zero, zero
+
+    // mmu is initialized and we're running out of an identity physical map
+
+    // save the physical address of .Lhigh
+    la      t1, .Lhigh
+
+    // bounce to the high address
+    la      t0, .Lhigh_addr
+    ld      t0, (t0)
+    jr      t0
+
+    // the full virtual address of the .Lhigh label
+.Lhigh_addr:
+    .quad   .Lhigh
+.Lhigh:
+    // we're now running at the high virtual address
+    // compute the delta between the old physical and newer high addresses
+    sub     t0, t0, t1
+
+    // fix up the gp, stack pointer, and return address
+    add     gp, gp, t0
+    add     sp, sp, t0
+    add     ra, ra, t0
+    ret
+#endif // RISCV_MMU
 
 .bss
 .align 4
