@@ -108,6 +108,13 @@ void platform_early_init(void) {
         riscv_set_secondary_count(cpu_count - 1);
     }
 
+#if WITH_KERNEL_VM
+    /* reserve the first 128K of ram which is marked protected by the PMP in firmware */
+    struct list_node list = LIST_INITIAL_VALUE(list);
+    pmm_alloc_range(MEMBASE, 0x20000 / PAGE_SIZE, &list);
+#endif
+
+
     LTRACEF("done scanning FDT\n");
 }
 

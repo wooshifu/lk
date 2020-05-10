@@ -34,7 +34,7 @@ struct mmu_initial_mapping mmu_initial_mappings[] = {
     /* all of memory, mapped in start.S */
     {
         .phys = 0,
-        .virt = KERNEL_BASE,
+        .virt = KERNEL_ASPACE_BASE,
 #if RISCV_MMU == 48
         .size = 512UL * GB,
 #elif RISCV_MMU == 39
@@ -154,8 +154,6 @@ status_t arch_mmu_query(arch_aspace_t *aspace, const vaddr_t vaddr, paddr_t *pad
 
     DEBUG_ASSERT(aspace);
 
-    *paddr = *flags = 0;
-
     // trim the vaddr to the aspace
     if (vaddr < aspace->base || vaddr > aspace->base + aspace->size - 1) {
         return ERR_OUT_OF_RANGE;
@@ -181,32 +179,36 @@ status_t arch_mmu_query(arch_aspace_t *aspace, const vaddr_t vaddr, paddr_t *pad
             // terminal entry
             LTRACEF_LEVEL(3, "terminal entry\n");
 
-            // extract the ppn
-            paddr_t pa = RISCV_PTE_PPN(pte);
-            uintptr_t page_mask = page_mask_per_level(level);
+            if (paddr) {
+                // extract the ppn
+                paddr_t pa = RISCV_PTE_PPN(pte);
+                uintptr_t page_mask = page_mask_per_level(level);
 
-            // add the va offset into the physical address
-            *paddr = pa | (vaddr & page_mask);
-            LTRACEF_LEVEL(3, "raw pa %#lx, page_mask %#lx, final pa %#lx\n", pa, page_mask, *paddr);
-
-            // compute the flags
-            uint f = 0;
-            if ((pte & (RISCV_PTE_R | RISCV_PTE_W)) == RISCV_PTE_R) {
-                f |= ARCH_MMU_FLAG_PERM_RO;
+                // add the va offset into the physical address
+                *paddr = pa | (vaddr & page_mask);
+                LTRACEF_LEVEL(3, "raw pa %#lx, page_mask %#lx, final pa %#lx\n", pa, page_mask, *paddr);
             }
-            f |= (pte & RISCV_PTE_X) ? 0 : ARCH_MMU_FLAG_PERM_NO_EXECUTE;
-            f |= (pte & RISCV_PTE_U) ? ARCH_MMU_FLAG_PERM_USER : 0;
 
-            *flags = f;
-            LTRACEF_LEVEL(3, "computed flags %#x\n", *flags);
+            if (flags) {
+                // compute the flags
+                uint f = 0;
+                if ((pte & (RISCV_PTE_R | RISCV_PTE_W)) == RISCV_PTE_R) {
+                    f |= ARCH_MMU_FLAG_PERM_RO;
+                }
+                f |= (pte & RISCV_PTE_X) ? 0 : ARCH_MMU_FLAG_PERM_NO_EXECUTE;
+                f |= (pte & RISCV_PTE_U) ? ARCH_MMU_FLAG_PERM_USER : 0;
+
+                *flags = f;
+                LTRACEF_LEVEL(3, "computed flags %#x\n", *flags);
+            }
+
             return NO_ERROR;
         }
 
         DEBUG_ASSERT(level > 0);
         level--;
     }
-
-    PANIC_UNIMPLEMENTED;
+    // unreachable
 }
 
 
