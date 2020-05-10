@@ -35,30 +35,6 @@ extern ulong lk_boot_args[4];
 #if WITH_KERNEL_VM
 #define DEFAULT_MEMORY_SIZE (MEMSIZE) /* try to fetch from the emulator via the fdt */
 
-/* initial memory mappings. parsed by start.S */
-struct mmu_initial_mapping mmu_initial_mappings[] = {
-    /* all of memory */
-    {
-        .phys = MEMORY_BASE_PHYS,
-        .virt = KERNEL_BASE,
-        .size = MEMORY_APERTURE_SIZE,
-        .flags = 0,
-        .name = "memory"
-    },
-
-    /* 1GB of peripherals */
-    {
-        .phys = PERIPHERAL_BASE_PHYS,
-        .virt = PERIPHERAL_BASE_VIRT,
-        .size = PERIPHERAL_BASE_SIZE,
-        .flags = MMU_INITIAL_MAPPING_FLAG_DEVICE,
-        .name = "peripherals"
-    },
-
-    /* null entry to terminate the list */
-    { 0 }
-};
-
 static pmm_arena_t arena = {
     .name = "ram",
     .base = MEMORY_BASE_PHYS,

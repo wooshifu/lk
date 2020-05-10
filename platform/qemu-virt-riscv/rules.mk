@@ -12,7 +12,7 @@ ifeq ($(RISCV_MODE),supervisor)
 ifeq ($(SUBARCH),32)
 RISCV_MMU ?= sv32
 else
-RISCV_MMU ?= sv48
+RISCV_MMU ?= sv39
 endif
 endif
 
