@@ -7,6 +7,8 @@
  */
 #pragma once
 
+#if RISCV_MMU
+
 #include <stdint.h>
 #include <arch/defines.h>
 
@@ -79,4 +81,6 @@ typedef uintptr_t riscv_pte_t;
 #define RISCV_SATP_ASID_SIZE  (16)
 #define RISCV_SATP_ASID_MASK  ((1UL << RISCV_SATP_ASID_SIZE) - 1)
 #endif
+
+#endif // RISCV_MMU
 
