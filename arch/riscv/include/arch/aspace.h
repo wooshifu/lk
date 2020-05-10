@@ -8,23 +8,20 @@
 #pragma once
 
 #include <lk/compiler.h>
-#include <lk/list.h>
 #include <arch/riscv/mmu.h>
 
 __BEGIN_CDECLS
 
 struct arch_aspace {
-#if 0
     /* pointer to the translation table */
-    paddr_t tt_phys;
-    pte_t *tt_virt;
+    paddr_t pt_phys;
+    volatile riscv_pte_t *pt_virt;
 
     uint flags;
 
     /* range of address space */
     vaddr_t base;
     size_t size;
-#endif
 };
 
 __END_CDECLS

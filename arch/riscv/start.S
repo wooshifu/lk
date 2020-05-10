@@ -125,7 +125,11 @@ LOCAL_FUNCTION(hart_trap)
     // for all MMU versions, identity map some amount of memory near 0 and
     // the same amount at the bottom of the kernel's address space
 LOCAL_FUNCTION(_mmu_init)
-    lla     t0, kernel_pgtable_top
+    lla     t0, kernel_pgtable
+
+    // store the physical address of the pgtable for future use
+    lla     t1, kernel_pgtable_phys
+    sd      t0, (t1)
 
     // compute kernel pgtable pointer (index 256)
     addi    t1, t0, (8 * 128)
@@ -164,8 +168,8 @@ LOCAL_FUNCTION(_mmu_init)
 
 .Lenable_mmu:
     // set the satp register and enable the mmu
-    // ASID 0, kernel_pgtable_top address
-    lla     t0, kernel_pgtable_top
+    // ASID 0, kernel_pgtable address
+    lla     t0, kernel_pgtable
     srli    t1, t0, 12
 #if RISCV_MMU == 48
     li      t2, (9 << 60)   // mode 9, SV48
@@ -176,7 +180,7 @@ LOCAL_FUNCTION(_mmu_init)
 #endif
     or      t1, t1, t2
     csrw    satp, t1
-    lla     s0, kernel_pgtable_top
+    lla     s0, kernel_pgtable
 
     // global tlb fence
     sfence.vma  zero, zero
