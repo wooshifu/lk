@@ -8,15 +8,17 @@
 #include "arch/riscv/mmu.h"
 
 #include <assert.h>
+#include <string.h>
 #include <lk/debug.h>
 #include <lk/err.h>
 #include <lk/trace.h>
+#include <arch/ops.h>
 #include <arch/mmu.h>
 #include <arch/riscv.h>
 #include <arch/riscv/csr.h>
 #include <kernel/vm.h>
 
-#define LOCAL_TRACE 1
+#define LOCAL_TRACE 0
 
 #if RISCV_MMU
 
@@ -81,10 +83,8 @@ static inline uint vaddr_to_index(vaddr_t va, uint level) {
     // canonicalize the address
     va &= RISCV_MMU_CANONICAL_MASK;
 
-    uint index = (va >> PAGE_SIZE_SHIFT) >> (level * RISCV_MMU_PT_SHIFT);
+    uint index = ((va >> PAGE_SIZE_SHIFT) >> (level * RISCV_MMU_PT_SHIFT)) & (RISCV_MMU_PT_ENTRIES - 1);
     LTRACEF_LEVEL(3, "canonical va %#lx, level %u = index %#x\n", va, level, index);
-
-    DEBUG_ASSERT(index < RISCV_MMU_PT_ENTRIES);
 
     return index;
 }
@@ -98,6 +98,36 @@ static uintptr_t page_size_per_level(uint level) {
 
 static uintptr_t page_mask_per_level(uint level) {
     return page_size_per_level(level) - 1;
+}
+
+static volatile riscv_pte_t *alloc_ptable(paddr_t *pa) {
+    // grab a page from the pmm
+    vm_page_t *p = pmm_alloc_page();
+    if (!p) {
+        return NULL;
+    }
+
+    // get the physical and virtual mappings of the page
+    *pa = vm_page_to_paddr(p);
+    riscv_pte_t *pte = paddr_to_kvaddr(*pa);
+
+    // zero it out
+    memset(pte, 0, PAGE_SIZE);
+
+    smp_wmb();
+
+    LTRACEF_LEVEL(3, "returning pa %#lx, va %p\n", *pa, pte);
+    return pte;
+}
+
+static riscv_pte_t mmu_flags_to_pte(uint flags) {
+    riscv_pte_t pte = 0;
+
+    pte |= (flags & ARCH_MMU_FLAG_PERM_USER) ? RISCV_PTE_U : 0;
+    pte |= (flags & ARCH_MMU_FLAG_PERM_RO) ? RISCV_PTE_R : (RISCV_PTE_R | RISCV_PTE_W);
+    pte |= (flags & ARCH_MMU_FLAG_PERM_NO_EXECUTE) ? 0 : RISCV_PTE_X;
+
+    return pte;
 }
 
 /* public api */
@@ -137,10 +167,78 @@ status_t arch_mmu_destroy_aspace(arch_aspace_t *aspace) {
 }
 
 /* routines to map/unmap/query mappings per address space */
-int arch_mmu_map(arch_aspace_t *aspace, vaddr_t vaddr, paddr_t paddr, uint count, uint flags) {
+int arch_mmu_map(arch_aspace_t *aspace, vaddr_t vaddr, paddr_t paddr, uint count, const uint flags) {
     LTRACEF("vaddr %#lx paddr %#lx count %u flags %#x\n", vaddr, paddr, count, flags);
 
-    PANIC_UNIMPLEMENTED;
+    DEBUG_ASSERT(aspace);
+
+restart:
+    if (count == 0)
+        return NO_ERROR;
+
+    // bootstrap the top level walk
+    uint level = RISCV_MMU_PT_LEVELS - 1;
+    uint index = vaddr_to_index(vaddr, level);
+    volatile riscv_pte_t *ptep = aspace->pt_virt + index;
+
+    for (;;) {
+        LTRACEF_LEVEL(2, "level %u, index %u, pte %p (%#lx) va %#lx pa %#lx\n",
+                level, index, ptep, *ptep, vaddr, paddr);
+
+        // look at our page table entry
+        riscv_pte_t pte = *ptep;
+        if (level > 0 && !(pte & RISCV_PTE_V)) {
+            // invalid entry, will have to add a page table
+            paddr_t ptp;
+            volatile riscv_pte_t *ptv = alloc_ptable(&ptp);
+            if (!ptv) {
+                return ERR_NO_MEMORY;
+            }
+
+            LTRACEF_LEVEL(2, "new ptable table %p, pa %#lx\n", ptv, ptp);
+
+            // link it in. RMW == 0 is a page table link
+            pte = RISCV_PTE_PPN_TO_PTE(ptp) | RISCV_PTE_V;
+            *ptep = pte;
+
+            // go one level deeper
+            level--;
+            index = vaddr_to_index(vaddr, level);
+            ptep = ptv + index;
+
+            continue;
+        } else if ((pte & RISCV_PTE_V) && !(pte & RISCV_PTE_PERM_MASK)) {
+            // next level page table pointer (RWX = 0)
+            paddr_t ptp = RISCV_PTE_PPN(pte);
+            volatile riscv_pte_t *ptv = paddr_to_kvaddr(ptp);
+
+            LTRACEF_LEVEL(2, "next level page table at %p, pa %#lx\n", ptv, ptp);
+
+            // go one level deeper
+            level--;
+            index = vaddr_to_index(vaddr, level);
+            ptep = ptv + index;
+        } else if (level > 0 && (pte & RISCV_PTE_V)) {
+            // terminal entry already exists at higher level
+            PANIC_UNIMPLEMENTED_MSG("terminal large page entry");
+        } else {
+            pte = RISCV_PTE_PPN_TO_PTE(paddr);
+            pte |= mmu_flags_to_pte(flags);
+            pte |= RISCV_PTE_A | RISCV_PTE_D | RISCV_PTE_V;
+            pte |= (aspace ->flags & ARCH_ASPACE_FLAG_KERNEL) ? RISCV_PTE_G : 0;
+
+            LTRACEF_LEVEL(2, "added new terminal entry: pte %#lx\n", pte);
+
+            *ptep = pte;
+
+            // simple algorithm, start walk from top
+            count--;
+            paddr += PAGE_SIZE;
+            vaddr += PAGE_SIZE;
+            goto restart;
+        }
+    }
+    // unreachable
 }
 
 int arch_mmu_unmap(arch_aspace_t *aspace, vaddr_t vaddr, uint count) {
@@ -165,7 +263,7 @@ status_t arch_mmu_query(arch_aspace_t *aspace, const vaddr_t vaddr, paddr_t *pad
 
     // walk down through the levels, looking for a terminal entry that matches our address
     for (;;) {
-        LTRACEF_LEVEL(2, "level %u, index %u, pte %p (%#llx)\n", level, index, ptep, *ptep);
+        LTRACEF_LEVEL(2, "level %u, index %u, pte %p (%#lx)\n", level, index, ptep, *ptep);
 
         // look at our page table entry
         riscv_pte_t pte = *ptep;
@@ -174,7 +272,7 @@ status_t arch_mmu_query(arch_aspace_t *aspace, const vaddr_t vaddr, paddr_t *pad
             return ERR_NOT_FOUND;
         } else if ((pte & RISCV_PTE_PERM_MASK) == 0) {
             // next level page table pointer (RWX = 0)
-            PANIC_UNIMPLEMENTED;
+            PANIC_UNIMPLEMENTED_MSG("page table walk");
         } else {
             // terminal entry
             LTRACEF_LEVEL(3, "terminal entry\n");

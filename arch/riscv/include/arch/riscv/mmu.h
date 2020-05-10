@@ -15,11 +15,7 @@
 #define MB                (1024UL*1024UL)
 #define GB                (1024UL*1024UL*1024UL)
 
-#if __riscv_xlen == 32
-typedef uint32_t riscv_pte_t;
-#elif __riscv_xlen == 64
-typedef uint64_t riscv_pte_t;
-#endif
+typedef uintptr_t riscv_pte_t;
 
 // some constants based on our particular implementation
 #if RISCV_MMU == 48
