@@ -16,7 +16,7 @@
 #include <arch/riscv/csr.h>
 #include <kernel/vm.h>
 
-#define LOCAL_TRACE 3
+#define LOCAL_TRACE 1
 
 #if RISCV_MMU
 
@@ -82,12 +82,25 @@ static inline uint vaddr_to_index(vaddr_t va, uint level) {
     va &= RISCV_MMU_CANONICAL_MASK;
 
     uint index = (va >> PAGE_SIZE_SHIFT) >> (level * RISCV_MMU_PT_SHIFT);
-    LTRACEF_LEVEL(3, "va %#lx, level %u = index %#x\n", va, level, index);
+    LTRACEF_LEVEL(3, "canonical va %#lx, level %u = index %#x\n", va, level, index);
 
     DEBUG_ASSERT(index < RISCV_MMU_PT_ENTRIES);
 
     return index;
 }
+
+static uintptr_t page_size_per_level(uint level) {
+    // levels count down from PT_LEVELS - 1
+    DEBUG_ASSERT(level < RISCV_MMU_PT_LEVELS);
+
+    return 1UL << (PAGE_SIZE_SHIFT + level * RISCV_MMU_PT_SHIFT);
+}
+
+static uintptr_t page_mask_per_level(uint level) {
+    return page_size_per_level(level) - 1;
+}
+
+/* public api */
 
 /* initialize per address space */
 status_t arch_mmu_init_aspace(arch_aspace_t *aspace, vaddr_t base, size_t size, uint flags) {
@@ -170,7 +183,23 @@ status_t arch_mmu_query(arch_aspace_t *aspace, const vaddr_t vaddr, paddr_t *pad
 
             // extract the ppn
             paddr_t pa = RISCV_PTE_PPN(pte);
-            LTRACEF_LEVEL(3, "pa %#lx\n", pa);
+            uintptr_t page_mask = page_mask_per_level(level);
+
+            // add the va offset into the physical address
+            *paddr = pa | (vaddr & page_mask);
+            LTRACEF_LEVEL(3, "raw pa %#lx, page_mask %#lx, final pa %#lx\n", pa, page_mask, *paddr);
+
+            // compute the flags
+            uint f = 0;
+            if ((pte & (RISCV_PTE_R | RISCV_PTE_W)) == RISCV_PTE_R) {
+                f |= ARCH_MMU_FLAG_PERM_RO;
+            }
+            f |= (pte & RISCV_PTE_X) ? 0 : ARCH_MMU_FLAG_PERM_NO_EXECUTE;
+            f |= (pte & RISCV_PTE_U) ? ARCH_MMU_FLAG_PERM_USER : 0;
+
+            *flags = f;
+            LTRACEF_LEVEL(3, "computed flags %#x\n", *flags);
+            return NO_ERROR;
         }
 
         DEBUG_ASSERT(level > 0);

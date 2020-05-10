@@ -84,4 +84,3 @@ typedef uint64_t riscv_pte_t;
 #define RISCV_SATP_ASID_MASK  ((1UL << RISCV_SATP_ASID_SIZE) - 1)
 #endif
 
-
