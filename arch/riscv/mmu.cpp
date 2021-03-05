@@ -20,7 +20,7 @@
 #include <arch/riscv/csr.h>
 #include <kernel/vm.h>
 
-#define LOCAL_TRACE 2
+#define LOCAL_TRACE 0
 
 #include <kernel/vm.h>
 
@@ -170,6 +170,7 @@ status_t arch_mmu_init_aspace(arch_aspace_t *aspace, vaddr_t base, size_t size, 
 
     return NO_ERROR;
 }
+
 status_t arch_mmu_destroy_aspace(arch_aspace_t *aspace) {
     LTRACEF("aspace %p\n", aspace);
 
@@ -218,8 +219,8 @@ restart:
             level--;
             index = vaddr_to_index(vaddr, level);
             ptep = ptv + index;
-        } else { // if (level > 0 && !(pte & RISCV_PTE_V)) {
-            // it's a non valid page entry
+        } else {
+            // it's a non valid page entry or a valid terminal entry
             // call the callback, seeing what the user wants
             auto ret = callback(level, index, &pte, &vaddr, &err);
             switch (ret) {
@@ -239,7 +240,7 @@ restart:
                     // commit the change and halt
                     *ptep = pte;
 
-                    return NO_ERROR; // TODO: allow error return
+                    return err;
                 case walk_cb_ret::ALLOC_PT:
                     // user wants us to add a page table and continue
                     paddr_t ptp;
