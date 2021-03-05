@@ -20,7 +20,7 @@
 #include <arch/riscv/csr.h>
 #include <kernel/vm.h>
 
-#define LOCAL_TRACE 0
+#define LOCAL_TRACE 2
 
 #include <kernel/vm.h>
 
@@ -176,7 +176,165 @@ status_t arch_mmu_destroy_aspace(arch_aspace_t *aspace) {
     PANIC_UNIMPLEMENTED;
 }
 
+enum class walk_cb_ret {
+    HALT,
+    RESTART,
+    COMMIT_AND_RESTART,
+    COMMIT_AND_HALT,
+    ALLOC_PT,
+};
+
+using page_walk_cb = walk_cb_ret(*)(uint level, uint index, riscv_pte_t *pte, vaddr_t *vaddr);
+
+template <typename F>
+static int riscv_pt_walk(arch_aspace_t *aspace, vaddr_t vaddr, F callback) { // paddr_t paddr, uint count, const uint flags) {
+    LTRACEF("vaddr %#lx\n", vaddr);
+
+    DEBUG_ASSERT(aspace);
+
+restart:
+    // bootstrap the top level walk
+    uint level = RISCV_MMU_PT_LEVELS - 1;
+    uint index = vaddr_to_index(vaddr, level);
+    volatile riscv_pte_t *ptep = aspace->pt_virt + index;
+
+    for (;;) {
+        LTRACEF_LEVEL(2, "level %u, index %u, pte %p (%#lx) va %#lx\n",
+                      level, index, ptep, *ptep, vaddr);
+
+        // look at our page table entry
+        riscv_pte_t pte = *ptep;
+        if (level > 0 && !(pte & RISCV_PTE_V)) {
+            // it's a non valid page table entry on an inner level
+            // call the callback, seeing what the user wants
+            auto ret = callback(level, index, &pte, &vaddr);
+            if (ret == walk_cb_ret::HALT) {
+                return NO_ERROR; // TODO allow error return
+            } else if (ret == walk_cb_ret::RESTART) {
+                goto restart;
+            } else if (ret == walk_cb_ret::ALLOC_PT) {
+                // user wants us to add a page table and continue
+                paddr_t ptp;
+                volatile riscv_pte_t *ptv = alloc_ptable(&ptp);
+                if (!ptv) {
+                    return ERR_NO_MEMORY;
+                }
+
+                LTRACEF_LEVEL(2, "new ptable table %p, pa %#lx\n", ptv, ptp);
+
+                // link it in. RMW == 0 is a page table link
+                pte = RISCV_PTE_PPN_TO_PTE(ptp) | RISCV_PTE_V;
+                *ptep = pte;
+
+                // go one level deeper
+                level--;
+                index = vaddr_to_index(vaddr, level);
+                ptep = ptv + index;
+            } else {
+                // all other returns are nonsensical here
+                PANIC_UNIMPLEMENTED;
+            }
+        } else if ((pte & RISCV_PTE_V) && !(pte & RISCV_PTE_PERM_MASK)) {
+            // next level page table pointer (RWX = 0)
+            paddr_t ptp = RISCV_PTE_PPN(pte);
+            volatile riscv_pte_t *ptv = (riscv_pte_t *)paddr_to_kvaddr(ptp);
+
+            LTRACEF_LEVEL(2, "next level page table at %p, pa %#lx\n", ptv, ptp);
+
+            // go one level deeper
+            level--;
+            index = vaddr_to_index(vaddr, level);
+            ptep = ptv + index;
+        } else {
+            // we've hit either an empty or terminal page table entry,
+            // ask the user what they want to do
+            auto ret = callback(level, index, &pte, &vaddr);
+            if (ret == walk_cb_ret::HALT) {
+                return NO_ERROR; // TODO allow error return
+            } else if (ret == walk_cb_ret::COMMIT_AND_RESTART) {
+                // callback has (hopefully) modified the pte and vaddr, we'll commit it and start the walk again
+                *ptep = pte;
+
+                goto restart;
+            } else if (ret == walk_cb_ret::COMMIT_AND_HALT) {
+                // commit the change and halt
+                *ptep = pte;
+
+                return NO_ERROR; // TODO: allow error return
+            } else {
+                PANIC_UNIMPLEMENTED;
+            }
+        }
+
+        // make sure we didn't decrement level one too many
+        DEBUG_ASSERT(level < RISCV_MMU_PT_LEVELS);
+    }
+    // unreachable
+}
+
+int arch_mmu_map(arch_aspace_t *aspace, vaddr_t vaddr, paddr_t paddr, uint count, const uint flags) {
+    LTRACEF("vaddr %#lx paddr %#lx count %u flags %#x\n", vaddr, paddr, count, flags);
+
+    DEBUG_ASSERT(aspace);
+
+    if (count == 0) {
+        return NO_ERROR;
+    }
+
+    auto map_cb = [&paddr, &count, aspace, flags](uint level, uint index, riscv_pte_t *pte, vaddr_t *vaddr) -> walk_cb_ret {
+        LTRACEF("level %u, index %u, pte %#lx, vaddr %#lx [paddr %#lx count %u flags %#x]\n", level, index, *pte, *vaddr, paddr, count, flags);
+
+        if ((*pte & RISCV_PTE_V)) {
+            // we have hit a valid pte of some kind
+
+            // assert that it's not a page table pointer, which we shouldn't be hitting in the callback
+            DEBUG_ASSERT(*pte & RISCV_PTE_PERM_MASK);
+
+            // for now, panic
+            if (level > 0) {
+                PANIC_UNIMPLEMENTED_MSG("terminal large page entry");
+            } else {
+                PANIC_UNIMPLEMENTED_MSG("terminal page entry");
+            }
+            return walk_cb_ret::HALT;
+        }
+
+        // hit a open terminal page table entry, lets add ours
+        if (level > 0) {
+            // level is > 0, allocate a page table here
+            // TODO: optimize by allocating large page here if possible
+            return walk_cb_ret::ALLOC_PT;
+        }
+
+        // adding a terminal page at level 0
+        riscv_pte_t temp_pte = RISCV_PTE_PPN_TO_PTE(paddr);
+        temp_pte |= mmu_flags_to_pte(flags);
+        temp_pte |= RISCV_PTE_A | RISCV_PTE_D | RISCV_PTE_V;
+        temp_pte |= (aspace->flags & ARCH_ASPACE_FLAG_KERNEL) ? RISCV_PTE_G : 0;
+
+        LTRACEF_LEVEL(2, "added new terminal entry: pte %#lx\n", temp_pte);
+
+        // modify what the walker handed us
+        *pte = temp_pte;
+        *vaddr += PAGE_SIZE;
+
+        // bump our state forward
+        paddr += PAGE_SIZE;
+        count--;
+
+        // if we're done, tell the caller to commit our changes and either restart the walk or halt
+        if (count == 0) {
+            return walk_cb_ret::COMMIT_AND_HALT;
+        } else {
+            return walk_cb_ret::COMMIT_AND_RESTART;
+        }
+    };
+
+    return riscv_pt_walk(aspace, vaddr, map_cb);
+}
+
 // routines to map/unmap/query mappings per address space
+#if 0
 int arch_mmu_map(arch_aspace_t *aspace, vaddr_t vaddr, paddr_t paddr, uint count, const uint flags) {
     LTRACEF("vaddr %#lx paddr %#lx count %u flags %#x\n", vaddr, paddr, count, flags);
 
@@ -259,6 +417,7 @@ restart:
     }
     // unreachable
 }
+#endif
 
 int arch_mmu_unmap(arch_aspace_t *aspace, vaddr_t vaddr, uint count) {
     LTRACEF("vaddr %#lx count %u\n", vaddr, count);
