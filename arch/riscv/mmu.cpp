@@ -186,8 +186,8 @@ enum class walk_cb_ret {
 
 using page_walk_cb = walk_cb_ret(*)(uint level, uint index, riscv_pte_t *pte, vaddr_t *vaddr);
 
-template <typename F>
-static int riscv_pt_walk(arch_aspace_t *aspace, vaddr_t vaddr, F callback) { // paddr_t paddr, uint count, const uint flags) {
+template <typename F = page_walk_cb>
+static int riscv_pt_walk(arch_aspace_t *aspace, vaddr_t vaddr, F callback) {
     LTRACEF("vaddr %#lx\n", vaddr);
 
     DEBUG_ASSERT(aspace);
@@ -204,37 +204,7 @@ restart:
 
         // look at our page table entry
         riscv_pte_t pte = *ptep;
-        if (level > 0 && !(pte & RISCV_PTE_V)) {
-            // it's a non valid page table entry on an inner level
-            // call the callback, seeing what the user wants
-            auto ret = callback(level, index, &pte, &vaddr);
-            if (ret == walk_cb_ret::HALT) {
-                return NO_ERROR; // TODO allow error return
-            } else if (ret == walk_cb_ret::RESTART) {
-                goto restart;
-            } else if (ret == walk_cb_ret::ALLOC_PT) {
-                // user wants us to add a page table and continue
-                paddr_t ptp;
-                volatile riscv_pte_t *ptv = alloc_ptable(&ptp);
-                if (!ptv) {
-                    return ERR_NO_MEMORY;
-                }
-
-                LTRACEF_LEVEL(2, "new ptable table %p, pa %#lx\n", ptv, ptp);
-
-                // link it in. RMW == 0 is a page table link
-                pte = RISCV_PTE_PPN_TO_PTE(ptp) | RISCV_PTE_V;
-                *ptep = pte;
-
-                // go one level deeper
-                level--;
-                index = vaddr_to_index(vaddr, level);
-                ptep = ptv + index;
-            } else {
-                // all other returns are nonsensical here
-                PANIC_UNIMPLEMENTED;
-            }
-        } else if ((pte & RISCV_PTE_V) && !(pte & RISCV_PTE_PERM_MASK)) {
+        if ((pte & RISCV_PTE_V) && !(pte & RISCV_PTE_PERM_MASK)) {
             // next level page table pointer (RWX = 0)
             paddr_t ptp = RISCV_PTE_PPN(pte);
             volatile riscv_pte_t *ptv = (riscv_pte_t *)paddr_to_kvaddr(ptp);
@@ -245,24 +215,47 @@ restart:
             level--;
             index = vaddr_to_index(vaddr, level);
             ptep = ptv + index;
-        } else {
-            // we've hit either an empty or terminal page table entry,
-            // ask the user what they want to do
+        } else { // if (level > 0 && !(pte & RISCV_PTE_V)) {
+            // it's a non valid page entry
+            // call the callback, seeing what the user wants
             auto ret = callback(level, index, &pte, &vaddr);
-            if (ret == walk_cb_ret::HALT) {
-                return NO_ERROR; // TODO allow error return
-            } else if (ret == walk_cb_ret::COMMIT_AND_RESTART) {
-                // callback has (hopefully) modified the pte and vaddr, we'll commit it and start the walk again
-                *ptep = pte;
+            switch (ret) {
+                case walk_cb_ret::HALT:
+                    // stop here
+                    return NO_ERROR; // TODO allow error return
+                case walk_cb_ret::RESTART:
+                    // restart the walk
+                    // user should have modified vaddr or we'll probably be in a loop
+                    goto restart;
+                case walk_cb_ret::COMMIT_AND_RESTART:
+                    // callback has (hopefully) modified the pte and vaddr, we'll commit it and start the walk again
+                    *ptep = pte;
 
-                goto restart;
-            } else if (ret == walk_cb_ret::COMMIT_AND_HALT) {
-                // commit the change and halt
-                *ptep = pte;
+                    goto restart;
+                case walk_cb_ret::COMMIT_AND_HALT:
+                    // commit the change and halt
+                    *ptep = pte;
 
-                return NO_ERROR; // TODO: allow error return
-            } else {
-                PANIC_UNIMPLEMENTED;
+                    return NO_ERROR; // TODO: allow error return
+                case walk_cb_ret::ALLOC_PT:
+                    // user wants us to add a page table and continue
+                    paddr_t ptp;
+                    volatile riscv_pte_t *ptv = alloc_ptable(&ptp);
+                    if (!ptv) {
+                        return ERR_NO_MEMORY;
+                    }
+
+                    LTRACEF_LEVEL(2, "new ptable table %p, pa %#lx\n", ptv, ptp);
+
+                    // link it in. RMW == 0 is a page table link
+                    pte = RISCV_PTE_PPN_TO_PTE(ptp) | RISCV_PTE_V;
+                    *ptep = pte;
+
+                    // go one level deeper
+                    level--;
+                    index = vaddr_to_index(vaddr, level);
+                    ptep = ptv + index;
+                    break;
             }
         }
 
@@ -272,8 +265,8 @@ restart:
     // unreachable
 }
 
-int arch_mmu_map(arch_aspace_t *aspace, vaddr_t vaddr, paddr_t paddr, uint count, const uint flags) {
-    LTRACEF("vaddr %#lx paddr %#lx count %u flags %#x\n", vaddr, paddr, count, flags);
+int arch_mmu_map(arch_aspace_t *aspace, const vaddr_t _vaddr, paddr_t paddr, uint count, const uint flags) {
+    LTRACEF("vaddr %#lx paddr %#lx count %u flags %#x\n", _vaddr, paddr, count, flags);
 
     DEBUG_ASSERT(aspace);
 
@@ -299,7 +292,7 @@ int arch_mmu_map(arch_aspace_t *aspace, vaddr_t vaddr, paddr_t paddr, uint count
             return walk_cb_ret::HALT;
         }
 
-        // hit a open terminal page table entry, lets add ours
+        // hit an open pate table entry
         if (level > 0) {
             // level is > 0, allocate a page table here
             // TODO: optimize by allocating large page here if possible
@@ -330,7 +323,7 @@ int arch_mmu_map(arch_aspace_t *aspace, vaddr_t vaddr, paddr_t paddr, uint count
         }
     };
 
-    return riscv_pt_walk(aspace, vaddr, map_cb);
+    return riscv_pt_walk(aspace, _vaddr, map_cb);
 }
 
 // routines to map/unmap/query mappings per address space
