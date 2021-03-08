@@ -220,26 +220,42 @@ status_t arch_mmu_destroy_aspace(arch_aspace_t *aspace) {
     PANIC_UNIMPLEMENTED;
 }
 
-enum class walk_cb_ret {
+enum class walk_cb_ret_op {
     HALT,
     RESTART,
-    COMMIT_AND_RESTART,
-    COMMIT_AND_HALT,
-    ALLOC_PT,
+    ALLOC_PT
 };
 
+struct walk_cb_ret {
+    static walk_cb_ret OpHalt(int err) { return { walk_cb_ret_op::HALT, err, false, 0, false }; }
+    static walk_cb_ret OpRestart() { return { walk_cb_ret_op::RESTART, NO_ERROR, false, 0, false }; }
+    static walk_cb_ret OpCommitHalt(riscv_pte_t pte, bool unmap, int err) { return { walk_cb_ret_op::HALT, err, true, pte, unmap }; }
+    static walk_cb_ret OpCommitRestart(riscv_pte_t pte, bool unmap) { return { walk_cb_ret_op::RESTART, NO_ERROR, true, pte, unmap }; }
+    static walk_cb_ret OpAllocPT() { return { walk_cb_ret_op::ALLOC_PT, 0, false, 0, false }; }
+
+    // overall continuation op
+    walk_cb_ret_op op;
+
+    // if halting, return error
+    int err;
+
+    // commit the pte entry
+    bool commit;
+    riscv_pte_t new_pte;
+    bool unmap; // we are unmapping, so test for empty page tables
+};
+
+
 // in the callback arg, define a function or lambda that matches this signature
-using page_walk_cb = walk_cb_ret(*)(uint level, uint index, riscv_pte_t *pte, vaddr_t *vaddr, int *err);
+using page_walk_cb = walk_cb_ret(*)(uint level, uint index, riscv_pte_t pte, vaddr_t *vaddr);
 
 // generic walker routine to automate drilling through a page table structure
-template <typename F = page_walk_cb>
+template <typename F>
 static int riscv_pt_walk(arch_aspace_t *aspace, vaddr_t vaddr, F callback) {
     LTRACEF("vaddr %#lx\n", vaddr);
 
     DEBUG_ASSERT(aspace);
 
-    // modifed by callback
-    int err = NO_ERROR;
 restart:
     // bootstrap the top level walk
     uint level = RISCV_MMU_PT_LEVELS - 1;
@@ -266,26 +282,27 @@ restart:
         } else {
             // it's a non valid page entry or a valid terminal entry
             // call the callback, seeing what the user wants
-            auto ret = callback(level, index, &pte, &vaddr, &err);
-            switch (ret) {
-                case walk_cb_ret::HALT:
-                    // stop here
-                    return err;
-                case walk_cb_ret::RESTART:
-                    // restart the walk
-                    // user should have modified vaddr or we'll probably be in a loop
-                    goto restart;
-                case walk_cb_ret::COMMIT_AND_RESTART:
-                    // callback has (hopefully) modified the pte and vaddr, we'll commit it and start the walk again
-                    *ptep = pte;
+            auto ret = callback(level, index, pte, &vaddr);
+            switch (ret.op) {
+                case walk_cb_ret_op::HALT:
+                case walk_cb_ret_op::RESTART:
+                    // see if we're being asked to commit a change
+                    if (ret.commit) {
+                        // commit the change
+                        *ptep = ret.new_pte;
+                        if (ret.unmap) {
+                            // TODO: this was an unmap, test to see if we have emptied a page table
+                        }
+                    }
 
-                    goto restart;
-                case walk_cb_ret::COMMIT_AND_HALT:
-                    // commit the change and halt
-                    *ptep = pte;
-
-                    return err;
-                case walk_cb_ret::ALLOC_PT:
+                    if (ret.op == walk_cb_ret_op::HALT) {
+                        // stop here
+                        return ret.err;
+                    } else { // RESTART
+                        // user should have modified vaddr or we'll probably be in a loop
+                        goto restart;
+                    }
+                case walk_cb_ret_op::ALLOC_PT:
                     // user wants us to add a page table and continue
                     paddr_t ptp;
                     volatile riscv_pte_t *ptv = alloc_ptable(&ptp);
@@ -331,15 +348,14 @@ int arch_mmu_map(arch_aspace_t *aspace, const vaddr_t _vaddr, paddr_t paddr, uin
     // construct a local callback for the walker routine that
     // a) tells the walker to build a page table if it's not present
     // b) fills in a terminal page table entry with a page and tells the walker to start over
-    auto map_cb = [&paddr, &count, aspace, flags](uint level, uint index, riscv_pte_t *pte, vaddr_t *vaddr, int *err) -> walk_cb_ret {
+    auto map_cb = [&paddr, &count, aspace, flags](uint level, uint index, riscv_pte_t pte, vaddr_t *vaddr) -> walk_cb_ret {
         LTRACEF("level %u, index %u, pte %#lx, vaddr %#lx [paddr %#lx count %u flags %#x]\n",
-                level, index, *pte, *vaddr, paddr, count, flags);
+                level, index, pte, *vaddr, paddr, count, flags);
 
-        if ((*pte & RISCV_PTE_V)) {
+        if ((pte & RISCV_PTE_V)) {
             // we have hit a valid pte of some kind
-
             // assert that it's not a page table pointer, which we shouldn't be hitting in the callback
-            DEBUG_ASSERT(*pte & RISCV_PTE_PERM_MASK);
+            DEBUG_ASSERT(pte & RISCV_PTE_PERM_MASK);
 
             // for now, panic
             if (level > 0) {
@@ -348,15 +364,14 @@ int arch_mmu_map(arch_aspace_t *aspace, const vaddr_t _vaddr, paddr_t paddr, uin
                 PANIC_UNIMPLEMENTED_MSG("terminal page entry");
             }
 
-            *err = ERR_ALREADY_EXISTS;
-            return walk_cb_ret::HALT;
+            return walk_cb_ret::OpHalt(ERR_ALREADY_EXISTS);
         }
 
         // hit an open pate table entry
         if (level > 0) {
             // level is > 0, allocate a page table here
             // TODO: optimize by allocating large page here if possible
-            return walk_cb_ret::ALLOC_PT;
+            return walk_cb_ret::OpAllocPT();
         }
 
         // adding a terminal page at level 0
@@ -368,7 +383,6 @@ int arch_mmu_map(arch_aspace_t *aspace, const vaddr_t _vaddr, paddr_t paddr, uin
         LTRACEF_LEVEL(2, "added new terminal entry: pte %#lx\n", temp_pte);
 
         // modify what the walker handed us
-        *pte = temp_pte;
         *vaddr += PAGE_SIZE;
 
         // bump our state forward
@@ -377,9 +391,9 @@ int arch_mmu_map(arch_aspace_t *aspace, const vaddr_t _vaddr, paddr_t paddr, uin
 
         // if we're done, tell the caller to commit our changes and either restart the walk or halt
         if (count == 0) {
-            return walk_cb_ret::COMMIT_AND_HALT;
+            return walk_cb_ret::OpCommitHalt(temp_pte, false, NO_ERROR);
         } else {
-            return walk_cb_ret::COMMIT_AND_RESTART;
+            return walk_cb_ret::OpCommitRestart(temp_pte, false);
         }
     };
 
@@ -399,17 +413,17 @@ status_t arch_mmu_query(arch_aspace_t *aspace, const vaddr_t _vaddr, paddr_t *pa
     // construct a local callback for the walker routine that
     // a) if it hits a terminal entry construct the flags we want and halt
     // b) all other cases just halt and return ERR_NOT_FOUND
-    auto query_cb = [paddr, aspace, flags](uint level, uint index, riscv_pte_t *pte, vaddr_t *vaddr, int *err) -> walk_cb_ret {
-        LTRACEF("level %u, index %u, pte %#lx, vaddr %#lx\n", level, index, *pte, *vaddr);
+    auto query_cb = [paddr, flags](uint level, uint index, riscv_pte_t pte, vaddr_t *vaddr) -> walk_cb_ret {
+        LTRACEF("level %u, index %u, pte %#lx, vaddr %#lx\n", level, index, pte, *vaddr);
 
-        if (*pte & RISCV_PTE_V) {
+        if (pte & RISCV_PTE_V) {
             // we have hit a valid pte of some kind
             // assert that it's not a page table pointer, which we shouldn't be hitting in the callback
-            DEBUG_ASSERT(*pte & RISCV_PTE_PERM_MASK);
+            DEBUG_ASSERT(pte & RISCV_PTE_PERM_MASK);
 
             if (paddr) {
                 // extract the ppn
-                paddr_t pa = RISCV_PTE_PPN(*pte);
+                paddr_t pa = RISCV_PTE_PPN(pte);
                 uintptr_t page_mask = page_mask_per_level(level);
 
                 // add the va offset into the physical address
@@ -419,15 +433,14 @@ status_t arch_mmu_query(arch_aspace_t *aspace, const vaddr_t _vaddr, paddr_t *pa
 
             if (flags) {
                 // compute the flags
-                *flags = pte_flags_to_mmu_flags(*pte);
+                *flags = pte_flags_to_mmu_flags(pte);
                 LTRACEF_LEVEL(3, "computed flags %#x\n", *flags);
             }
-            *err = NO_ERROR;
-            return walk_cb_ret::HALT;
+            // we found our page, so stop
+            return walk_cb_ret::OpHalt(NO_ERROR);
         } else {
-            // any other conditions just stop
-            *err = ERR_NOT_FOUND;
-            return walk_cb_ret::HALT;
+            // couldnt find our page, stop
+            return walk_cb_ret::OpHalt(ERR_NOT_FOUND);
         }
     };
 
@@ -453,13 +466,13 @@ int arch_mmu_unmap(arch_aspace_t *aspace, const vaddr_t _vaddr, const uint _coun
     // b) if it hits an empty spot continue
     auto count = _count;
     auto unmap_cb = [&count]
-        (uint level, uint index, riscv_pte_t *pte, vaddr_t *vaddr, int *err) -> walk_cb_ret {
-        LTRACEF("level %u, index %u, pte %#lx, vaddr %#lx\n", level, index, *pte, *vaddr);
+        (uint level, uint index, riscv_pte_t pte, vaddr_t *vaddr) -> walk_cb_ret {
+        LTRACEF("level %u, index %u, pte %#lx, vaddr %#lx\n", level, index, pte, *vaddr);
 
-        if (*pte & RISCV_PTE_V) {
+        if (pte & RISCV_PTE_V) {
             // we have hit a valid pte of some kind
             // assert that it's not a page table pointer, which we shouldn't be hitting in the callback
-            DEBUG_ASSERT(*pte & RISCV_PTE_PERM_MASK);
+            DEBUG_ASSERT(pte & RISCV_PTE_PERM_MASK);
 
             if (level > 0) {
                 PANIC_UNIMPLEMENTED_MSG("cannot handle unmapping of large page");
@@ -467,22 +480,21 @@ int arch_mmu_unmap(arch_aspace_t *aspace, const vaddr_t _vaddr, const uint _coun
 
             // zero it out, which should unmap the page
             // TODO: handle freeing upper level page tables
-            *pte = 0;
             *vaddr += PAGE_SIZE;
             count--;
             if (count == 0) {
-                return walk_cb_ret::COMMIT_AND_HALT;
+                return walk_cb_ret::OpCommitHalt(0, true, NO_ERROR);
             } else {
-                return walk_cb_ret::COMMIT_AND_RESTART;
+                return walk_cb_ret::OpCommitRestart(0, true);
             }
         } else {
             // nothing here so skip forward and try the next page
             *vaddr += PAGE_SIZE;
             count--;
             if (count == 0) {
-                return walk_cb_ret::HALT;
+                return walk_cb_ret::OpHalt(NO_ERROR);
             } else {
-                return walk_cb_ret::RESTART;
+                return walk_cb_ret::OpRestart();
             }
         }
     };
