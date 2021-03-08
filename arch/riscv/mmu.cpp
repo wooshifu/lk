@@ -18,6 +18,7 @@
 #include <arch/mmu.h>
 #include <arch/riscv.h>
 #include <arch/riscv/csr.h>
+#include <arch/riscv/sbi.h>
 #include <kernel/vm.h>
 
 #define LOCAL_TRACE 0
@@ -72,7 +73,19 @@ static inline void riscv_set_satp(uint asid, paddr_t pt) {
     riscv_csr_write(RISCV_CSR_SATP, satp);
 
     // TODO: TLB flush here or use asid properly
-    // sfence.vma zero, zero
+    asm("sfence.vma zero, zero");
+}
+
+static void riscv_tlb_flush_vma_range(vaddr_t base, size_t size) {
+    // Use SBI to shoot down a range of vaddrs on all the cpus
+    ulong hart_mask = -1; // TODO: be more selective about the cpus
+    sbi_rfence_vma(&hart_mask, base, size);
+}
+
+static void riscv_tlb_flush_global() {
+    // Use SBI to do a global TLB shoot down on all cpus
+    ulong hart_mask = -1; // TODO: be more selective about the cpus
+    sbi_rfence_vma(&hart_mask, 0, 0);
 }
 
 // given a va address and the level, compute the index in the current PT
@@ -185,6 +198,7 @@ enum class walk_cb_ret {
     ALLOC_PT,
 };
 
+// in the callback arg, define a function or lambda that matches this signature
 using page_walk_cb = walk_cb_ret(*)(uint level, uint index, riscv_pte_t *pte, vaddr_t *vaddr, int *err);
 
 // generic walker routine to automate drilling through a page table structure
@@ -282,9 +296,14 @@ int arch_mmu_map(arch_aspace_t *aspace, const vaddr_t _vaddr, paddr_t paddr, uin
     if (_vaddr < aspace->base || _vaddr > aspace->base + aspace->size - 1) {
         return ERR_OUT_OF_RANGE;
     }
+    // TODO: make sure _vaddr + count * PAGE_SIZE is within the address space
 
+    // construct a local callback for the walker routine that
+    // a) tells the walker to build a page table if it's not present
+    // b) fills in a terminal page table entry with a page and tells the walker to start over
     auto map_cb = [&paddr, &count, aspace, flags](uint level, uint index, riscv_pte_t *pte, vaddr_t *vaddr, int *err) -> walk_cb_ret {
-        LTRACEF("level %u, index %u, pte %#lx, vaddr %#lx [paddr %#lx count %u flags %#x]\n", level, index, *pte, *vaddr, paddr, count, flags);
+        LTRACEF("level %u, index %u, pte %#lx, vaddr %#lx [paddr %#lx count %u flags %#x]\n",
+                level, index, *pte, *vaddr, paddr, count, flags);
 
         if ((*pte & RISCV_PTE_V)) {
             // we have hit a valid pte of some kind
@@ -347,6 +366,9 @@ status_t arch_mmu_query(arch_aspace_t *aspace, const vaddr_t _vaddr, paddr_t *pa
         return ERR_OUT_OF_RANGE;
     }
 
+    // construct a local callback for the walker routine that
+    // a) if it hits a terminal entry construct the flags we want and halt
+    // b) all other cases just halt and return ERR_NOT_FOUND
     auto query_cb = [paddr, aspace, flags](uint level, uint index, riscv_pte_t *pte, vaddr_t *vaddr, int *err) -> walk_cb_ret {
         LTRACEF("level %u, index %u, pte %#lx, vaddr %#lx\n", level, index, *pte, *vaddr);
 
@@ -382,10 +404,64 @@ status_t arch_mmu_query(arch_aspace_t *aspace, const vaddr_t _vaddr, paddr_t *pa
     return riscv_pt_walk(aspace, _vaddr, query_cb);
 }
 
-int arch_mmu_unmap(arch_aspace_t *aspace, vaddr_t vaddr, uint count) {
-    LTRACEF("vaddr %#lx count %u\n", vaddr, count);
+int arch_mmu_unmap(arch_aspace_t *aspace, const vaddr_t _vaddr, uint count) {
+    LTRACEF("vaddr %#lx count %u\n", _vaddr, count);
 
-    PANIC_UNIMPLEMENTED;
+    DEBUG_ASSERT(aspace);
+
+    if (count == 0) {
+        return NO_ERROR;
+    }
+    // trim the vaddr to the aspace
+    if (_vaddr < aspace->base || _vaddr > aspace->base + aspace->size - 1) {
+        return ERR_OUT_OF_RANGE;
+    }
+    // TODO: make sure _vaddr + count * PAGE_SIZE is within the address space
+
+    // construct a local callback for the walker routine that
+    // a) if it hits a terminal 4K entry write zeros to it
+    // b) if it hits an empty spot continue
+    auto unmap_cb = [&count]
+        (uint level, uint index, riscv_pte_t *pte, vaddr_t *vaddr, int *err) -> walk_cb_ret {
+        LTRACEF("level %u, index %u, pte %#lx, vaddr %#lx\n", level, index, *pte, *vaddr);
+
+        if (*pte & RISCV_PTE_V) {
+            // we have hit a valid pte of some kind
+            // assert that it's not a page table pointer, which we shouldn't be hitting in the callback
+            DEBUG_ASSERT(*pte & RISCV_PTE_PERM_MASK);
+
+            if (level > 0) {
+                PANIC_UNIMPLEMENTED_MSG("cannot handle unmapping of large page");
+            }
+
+            // zero it out, which should unmap the page
+            // TODO: handle freeing upper level page tables
+            *pte = 0;
+            *vaddr += PAGE_SIZE;
+            count--;
+            if (count == 0) {
+                return walk_cb_ret::COMMIT_AND_HALT;
+            } else {
+                return walk_cb_ret::COMMIT_AND_RESTART;
+            }
+        } else {
+            // nothing here so skip forward and try the next page
+            *vaddr += PAGE_SIZE;
+            count--;
+            if (count == 0) {
+                return walk_cb_ret::HALT;
+            } else {
+                return walk_cb_ret::RESTART;
+            }
+        }
+    };
+
+    int ret = riscv_pt_walk(aspace, _vaddr, unmap_cb);
+
+    // TLB shootdown the range we've unmapped
+    riscv_tlb_flush_vma_range(_vaddr, count * PAGE_SIZE);
+
+    return ret;
 }
 
 // load a new user address space context.
