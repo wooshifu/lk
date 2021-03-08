@@ -31,6 +31,7 @@
 
 riscv_pte_t kernel_pgtable[512] __ALIGNED(PAGE_SIZE);
 paddr_t kernel_pgtable_phys; // filled in by start.S
+static ulong riscv_asid_mask;
 
 // initial memory mappings. VM uses to construct mappings after the fact
 struct mmu_initial_mapping mmu_initial_mappings[] = {
@@ -53,6 +54,24 @@ struct mmu_initial_mapping mmu_initial_mappings[] = {
     { }
 };
 
+// called once on the boot cpu during very early (single threaded) init
+extern "C"
+void riscv_early_mmu_init() {
+    // figure out the number of support ASID bits by writing all 1s to
+    // the asid field in satp and seeing which ones 'stick'
+    auto satp_orig = riscv_csr_read(satp);
+    auto satp = satp_orig | (RISCV_SATP_ASID_MASK << RISCV_SATP_ASID_SHIFT);
+    riscv_csr_write(satp, satp);
+    riscv_asid_mask = (riscv_csr_read(satp) >> RISCV_SATP_ASID_SHIFT) & RISCV_SATP_ASID_MASK;
+    riscv_csr_write(satp, satp_orig);
+}
+
+// called a bit later once on the boot cpu
+extern "C"
+void riscv_mmu_init() {
+    printf("RISCV: MMU ASID mask %#lx\n", riscv_asid_mask);
+}
+
 static inline void riscv_set_satp(uint asid, paddr_t pt) {
     ulong satp;
 
@@ -63,12 +82,12 @@ static inline void riscv_set_satp(uint asid, paddr_t pt) {
 #endif
 
     // make sure the asid is in range
-    DEBUG_ASSERT((asid & RISCV_SATP_ASID_MASK) == 0);
+    DEBUG_ASSERT(asid & riscv_asid_mask);
     satp |= (ulong)asid << RISCV_SATP_ASID_SHIFT;
 
     // make sure the page table is aligned
     DEBUG_ASSERT(IS_PAGE_ALIGNED(pt));
-    satp |= pt;
+    satp |= pt >> PAGE_SIZE_SHIFT;
 
     riscv_csr_write(RISCV_CSR_SATP, satp);
 
@@ -76,16 +95,27 @@ static inline void riscv_set_satp(uint asid, paddr_t pt) {
     asm("sfence.vma zero, zero");
 }
 
-static void riscv_tlb_flush_vma_range(vaddr_t base, size_t size) {
+static void riscv_tlb_flush_vma_range(vaddr_t base, size_t count) {
+    if (count == 0)
+        return;
+
     // Use SBI to shoot down a range of vaddrs on all the cpus
     ulong hart_mask = -1; // TODO: be more selective about the cpus
-    sbi_rfence_vma(&hart_mask, base, size);
+    sbi_rfence_vma(&hart_mask, base, count * PAGE_SIZE);
+
+    // locally shoot down
+    // XXX: is this needed or does the sbi call do it if included in the local hart mask?
+    while (count > 0) {
+        asm volatile("sfence.vma %0, zero" :: "r"(base));
+        base += PAGE_SIZE;
+        count--;
+    }
 }
 
 static void riscv_tlb_flush_global() {
     // Use SBI to do a global TLB shoot down on all cpus
     ulong hart_mask = -1; // TODO: be more selective about the cpus
-    sbi_rfence_vma(&hart_mask, 0, 0);
+    sbi_rfence_vma(&hart_mask, 0, -1);
 }
 
 // given a va address and the level, compute the index in the current PT
@@ -404,12 +434,12 @@ status_t arch_mmu_query(arch_aspace_t *aspace, const vaddr_t _vaddr, paddr_t *pa
     return riscv_pt_walk(aspace, _vaddr, query_cb);
 }
 
-int arch_mmu_unmap(arch_aspace_t *aspace, const vaddr_t _vaddr, uint count) {
-    LTRACEF("vaddr %#lx count %u\n", _vaddr, count);
+int arch_mmu_unmap(arch_aspace_t *aspace, const vaddr_t _vaddr, const uint _count) {
+    LTRACEF("vaddr %#lx count %u\n", _vaddr, _count);
 
     DEBUG_ASSERT(aspace);
 
-    if (count == 0) {
+    if (_count == 0) {
         return NO_ERROR;
     }
     // trim the vaddr to the aspace
@@ -421,6 +451,7 @@ int arch_mmu_unmap(arch_aspace_t *aspace, const vaddr_t _vaddr, uint count) {
     // construct a local callback for the walker routine that
     // a) if it hits a terminal 4K entry write zeros to it
     // b) if it hits an empty spot continue
+    auto count = _count;
     auto unmap_cb = [&count]
         (uint level, uint index, riscv_pte_t *pte, vaddr_t *vaddr, int *err) -> walk_cb_ret {
         LTRACEF("level %u, index %u, pte %#lx, vaddr %#lx\n", level, index, *pte, *vaddr);
@@ -459,7 +490,7 @@ int arch_mmu_unmap(arch_aspace_t *aspace, const vaddr_t _vaddr, uint count) {
     int ret = riscv_pt_walk(aspace, _vaddr, unmap_cb);
 
     // TLB shootdown the range we've unmapped
-    riscv_tlb_flush_vma_range(_vaddr, count * PAGE_SIZE);
+    riscv_tlb_flush_vma_range(_vaddr, _count);
 
     return ret;
 }
